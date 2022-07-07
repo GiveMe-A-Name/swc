@@ -97,12 +97,13 @@ impl StableSourceFileId {
 }
 
 // _____________________________________________________________________________
-// SourceMap
+// SourceMap Files
 //
 
 #[derive(Default)]
 pub(super) struct SourceMapFiles {
     pub(super) source_files: Vec<Lrc<SourceFile>>,
+    /// map结构，uid -> sourceFile 的关系映射
     stable_id_to_source_file: AHashMap<StableSourceFileId, Lrc<SourceFile>>,
 }
 
@@ -128,12 +129,15 @@ pub(super) struct SourceMapFiles {
 pub struct SourceMap {
     pub(super) files: Lock<SourceMapFiles>,
     start_pos: AtomicUsize,
+    /// file handle's about (file_exist, read_files)
     file_loader: Box<dyn FileLoader + Sync + Send>,
     // This is used to apply the file path remapping as specified via
     // --remap-path-prefix to all SourceFiles allocated within this SourceMap.
+    // ?? 什么是path_mapping?
     path_mapping: FilePathMapping,
     /// In case we are in a doctest, replace all file names with the PathBuf,
     /// and add the given offsets to the line info
+    /// ?? offset?
     doctest_offset: Option<(FileName, isize)>,
 }
 
@@ -175,6 +179,8 @@ impl SourceMap {
         self.file_loader.file_exists(path)
     }
 
+    /// input: source_file path
+    /// output: SourceFile
     pub fn load_file(&self, path: &Path) -> io::Result<Lrc<SourceFile>> {
         let src = self.file_loader.read_file(path)?;
         let filename = path.to_owned().into();

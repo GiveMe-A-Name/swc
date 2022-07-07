@@ -5,17 +5,17 @@ use swc::{self, config::JsMinifyOptions, try_with_handler, BoolOrDataConfig, Han
 use swc_common::SourceMap;
 
 fn main() {
-    let cm = Arc::<SourceMap>::default();
+    let source_map = Arc::<SourceMap>::default();
 
-    let c = swc::Compiler::new(cm.clone());
+    let c = swc::Compiler::new(source_map.clone());
 
     let output = try_with_handler(
-        cm.clone(),
+        source_map.clone(),
         HandlerOpts {
             ..Default::default()
         },
         |handler| {
-            let fm = cm
+            let fm = source_map
                 .load_file(Path::new("examples/minify-input.js"))
                 .expect("failed to load file");
 

@@ -800,6 +800,7 @@ impl Sub<BytePos> for NonNarrowChar {
 }
 
 /// A single source in the SourceMap.
+/// （文件源代码存储结构）
 #[cfg_attr(
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
@@ -820,14 +821,19 @@ pub struct SourceFile {
     /// Indicates which crate this `SourceFile` was imported from.
     pub crate_of_origin: u32,
     /// The complete source code
+    /// 文件的源码，使用String进行存储
     pub src: Lrc<String>,
     /// The source code's hash
+    /// 源代码的hash值
     pub src_hash: u128,
     /// The start position of this source in the `SourceMap`
+    /// （开始位置）
     pub start_pos: BytePos,
     /// The end position of this source in the `SourceMap`
+    /// （结束位置）
     pub end_pos: BytePos,
     /// Locations of lines beginnings in the source code
+    /// （源码总行数）
     pub lines: Vec<BytePos>,
     /// Locations of multi-byte characters in the source code
     pub multibyte_chars: Vec<MultiByteChar>,
