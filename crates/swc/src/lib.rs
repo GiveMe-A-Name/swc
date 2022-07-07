@@ -223,6 +223,8 @@ pub struct Compiler {
     globals: Globals,
     /// CodeMap
     pub cm: Arc<SourceMap>,
+
+    /// 多线程实现[注释]
     comments: SwcComments,
 }
 
@@ -927,7 +929,7 @@ impl Compiler {
         &self,
         fm: Arc<SourceFile>,
         handler: &Handler,
-        opts: &JsMinifyOptions,
+        opts: &JsMinifyOptions, // minify的选项
     ) -> Result<TransformOutput, Error> {
         self.run(|| {
             let _timer = timer!("Compiler.minify");
