@@ -40,5 +40,6 @@ fn main() {
         .map_err(|e| e.into_diagnostic(&handler).emit())
         .expect("Failed to parse module.");
 
-    println!("Tokens: {:?}", parser.input().take());
+    // println!("{}",parser.)
+    println!("Tokens: {:#?}", parser.input().take());
 }
