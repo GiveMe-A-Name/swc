@@ -5,7 +5,7 @@ use crate::{LogosError, RawLexer};
 impl<'a> RawLexer<'a> {
     /// Current token must be [`RawToken::DivOp`]
     pub fn read_regexp(&mut self) -> Result<&'a str, LogosError> {
-        self.reset_peeked();
+        // self.reset_peeked();
 
         let s = self.lexer.inner().remainder();
         let remainder_len = s.len();

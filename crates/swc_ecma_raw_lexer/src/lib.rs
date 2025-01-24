@@ -3,17 +3,18 @@
 //!
 //! It may updated without proper semver bump.
 
-use std::fmt::Debug;
+use std::{collections::VecDeque, fmt::Debug};
 
 use logos::{Lexer, Logos, Skip};
 use swc_common::{input::StringInput, BytePos};
 
 use crate::{
+    identifier::consume_ident_part,
     peek::{peek_nth, PeekNth},
     string::{consume_str_double_quote, consume_str_single_quote},
 };
 
-pub mod jsx;
+mod identifier;
 mod peek;
 mod regexp;
 mod size_hint;
@@ -21,13 +22,12 @@ mod string;
 
 /// A lexer that can be used to create [RawToken].
 #[derive(Clone)]
-pub struct RawLexer<'a> {
-    lexer: PeekNth<logos::SpannedIter<'a, RawToken>>,
-    base_pos: BytePos,
+pub struct RawLexer<'source> {
+    lexer: PeekNth<logos::SpannedIter<'source, RawToken>>,
+    lexer2: Lexer<'source, RawToken>,
+    peeked: VecDeque<RawToken>,
     pos: BytePos,
-    orig_str: &'a str,
     start_pos: BytePos,
-    end_pos: BytePos,
 }
 
 impl Debug for RawLexer<'_> {
@@ -39,79 +39,102 @@ impl Debug for RawLexer<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct TokenState {
     pub had_line_break: bool,
+    pub is_in_tpl: bool,
 }
 
-impl<'a> RawLexer<'a> {
-    pub fn new(input: StringInput<'a>) -> Self {
+impl<'source> RawLexer<'source> {
+    pub fn new(input: StringInput<'source>) -> Self {
+        let source = input.as_str();
+
         Self {
-            lexer: peek_nth(logos::Lexer::new(input.as_str()).spanned()),
-            base_pos: input.start_pos(),
+            lexer: peek_nth(logos::Lexer::new(source).spanned()),
+            lexer2: Lexer::new(source),
+            // TODO: like oxc with a number capacity
+            peeked: Default::default(),
             pos: input.start_pos(),
-            orig_str: input.as_str(),
             start_pos: input.start_pos(),
-            end_pos: input.end_pos(),
         }
     }
 
-    pub const fn start_pos(&self) -> BytePos {
-        self.start_pos
+    fn source(&self) -> &str {
+        self.lexer2.source()
     }
 
-    pub const fn end_pos(&self) -> BytePos {
-        self.end_pos
+    pub fn start_pos(&self) -> BytePos {
+        self.span().lo
+    }
+
+    pub fn end_pos(&self) -> BytePos {
+        self.span().hi
     }
 
     pub fn cur_pos(&self) -> BytePos {
-        self.pos
+        self.span().lo
     }
 
     pub fn cur_hi(&mut self) -> BytePos {
-        let span = self.lexer.peek().map(|v| v.1.clone()).unwrap_or_default();
-
-        // +1 because hi is exclusive
-        self.pos + BytePos(span.len() as u32 + 1)
+        self.span().hi
     }
 
     pub fn update_cur_pos(&mut self) -> BytePos {
-        let span = self.lexer.peek().map(|v| v.1.clone()).unwrap_or_default();
-        self.pos = self.base_pos + BytePos(span.start as u32);
-        self.pos
+        self.span().lo
     }
 
     pub fn cur(&mut self) -> Result<Option<RawToken>, LogosError> {
-        self.lexer.peek().map(|(t, _)| *t).transpose()
+        self.peek()
     }
 
     pub fn peek(&mut self) -> Result<Option<RawToken>, LogosError> {
-        self.lexer.peek_nth(1).map(|(t, _)| *t).transpose()
+        self.peek_nth(0)
     }
 
     pub fn peek_ahead(&mut self) -> Result<Option<RawToken>, LogosError> {
-        self.lexer.peek_nth(2).map(|(t, _)| *t).transpose()
+        self.peek_nth(1)
+    }
+
+    fn peek_nth(&mut self, n: usize) -> Result<Option<RawToken>, LogosError> {
+        if let Some(peek) = self.peeked.get(n) {
+            return Ok(Some(*peek));
+        }
+
+        while self.peeked.len() <= n {
+            let next_token = self.lexer2.next().transpose()?;
+
+            match next_token {
+                Some(next_token) => {
+                    self.peeked.push_back(next_token);
+                }
+                None => return Ok(None),
+            }
+        }
+
+        Ok(self.peeked.get(n).cloned())
     }
 
     pub fn cur_char(&mut self) -> Option<char> {
-        let lo = self.pos.0 - self.start_pos.0;
-
-        let source = unsafe {
-            // Safety: self.pos is always within the bounds of `self.orig_str` and it's
-            // always at the char boundary
-            self.orig_str.get_unchecked(lo as usize..)
-        };
-
-        source.chars().next()
+        self.lexer2.remainder().chars().next()
     }
 
     pub fn peek_char(&mut self) -> Option<char> {
-        self.reset_peeked();
-
-        self.lexer.inner_mut().remainder().chars().nth(1)
+        self.lexer2.remainder().chars().nth(1)
     }
 
     pub fn peek_ahead_char(&mut self) -> Option<char> {
-        self.reset_peeked();
+        self.lexer2.remainder().chars().nth(2)
+    }
 
-        self.lexer.inner_mut().remainder().chars().nth(2)
+    /// Get the span for current token in input.
+    pub fn span(&self) -> swc_common::Span {
+        let range = self.lexer2.span();
+
+        let start = range.start as u32;
+        let end = range.end as u32;
+
+        // +1 because hi is exclusive
+        swc_common::Span {
+            lo: BytePos(start + 1),
+            hi: BytePos(end + 1),
+        }
     }
 
     /// # Safety
@@ -121,46 +144,43 @@ impl<'a> RawLexer<'a> {
         let lo = start.0 - self.start_pos.0;
         let hi = end.0 - self.start_pos.0;
 
-        self.orig_str.get_unchecked(lo as usize..hi as usize)
+        self.source().get_unchecked(lo as usize..hi as usize)
     }
 
-    pub fn cur_slice(&mut self) -> &str {
-        let Some((_, span)) = self.lexer.peek() else {
-            return "";
-        };
-        let span = span.clone();
-
-        unsafe {
-            // Safety: `span` is within the bounds of `self.lexer` because we get it from
-            // `self.lexer.next()`
-            self.lexer.inner_mut().source().get_unchecked(span)
-        }
+    pub fn cur_slice(&self) -> &str {
+        self.lexer2.slice()
     }
+
+    // pub fn cur_token_value(&mut self) -> TokenValue {
+    //     let cur_slice = self.cur_slice();
+    //     let cur_token = self.cur();
+    // }
 
     /// # Safety
     ///
     /// - `n` must be equal or smaller than  lefting length of `self.orig_str`
-    pub unsafe fn bump(&mut self, n: usize) {
-        self.reset_peeked();
+    pub fn bump(&mut self, n: usize) {
+        self.lexer2.bump(n);
+        // self.reset_peeked();
 
-        self.lexer.inner_mut().bump(n);
-        if let Some((_, span)) = self.lexer.peek() {
-            self.pos = self.base_pos + BytePos(span.start as u32);
-        }
+        // self.lexer.inner_mut().bump(n);
+        // if let Some((_, span)) = self.lexer.peek() {
+        //     self.pos = self.base_pos + BytePos(span.start as u32);
+        // }
     }
 
-    pub fn eat(&mut self, token: RawToken) -> bool {
-        let Ok(Some(cur)) = self.cur() else {
-            return false;
-        };
+    // pub fn eat(&mut self, token: RawToken) -> Result<bool, LogosError> {
+    //     let Ok(Some(cur)) = self.cur() else {
+    //         return false;
+    //     };
 
-        if cur == token {
-            self.next();
-            true
-        } else {
-            false
-        }
-    }
+    //     if cur == token {
+    //         self.next();
+    //         true
+    //     } else {
+    //         false
+    //     }
+    // }
 
     pub fn is_ascii(&mut self, c: u8) -> bool {
         self.cur_char() == Some(c as char)
@@ -180,40 +200,48 @@ impl<'a> RawLexer<'a> {
         }
     }
 
-    /// # Safety
+    ///# Safety
     ///
     /// - `pos` must be within the bounds of `self.orig_str`
     pub unsafe fn reset_to(&mut self, pos: BytePos) {
-        let lo = pos.0 - self.start_pos.0;
-        let hi = self.end_pos.0 - self.start_pos.0;
-
-        let source = self.orig_str.get_unchecked(lo as usize..hi as usize);
-
-        self.lexer = peek_nth(logos::Lexer::new(source).spanned());
-        self.base_pos = pos;
-        self.pos = pos;
+        self.lexer2 = Lexer::new(self.lexer2.source());
     }
 
-    fn reset_peeked(&mut self) {
-        unsafe {
-            let lo = self.pos.0 - self.start_pos.0;
-
-            // Safety: We already checked for the current char
-            let source = self.orig_str.get_unchecked(lo as usize..);
-
-            self.lexer = peek_nth(logos::Lexer::new(source).spanned());
-        }
+    pub fn state_mut(&mut self) -> &mut TokenState {
+        &mut self.lexer2.extras
     }
+
+    pub fn state(&self) -> &TokenState {
+        &self.lexer2.extras
+    }
+
+    pub fn set_state(&mut self, state: TokenState) {
+        self.lexer2.extras = state;
+    }
+
+    // fn reset_peeked(&mut self) {
+    //     unsafe {
+    //         // let lo = self.pos.0 - self.start_pos.0;
+
+    //         // Safety: We already checked for the current char
+    //         // let source = self.orig_str.get_unchecked(lo as usize..);
+
+    //         // self.lexer = peek_nth(logos::Lexer::new(source).spanned());
+    //     }
+    // }
 }
 
 impl Iterator for RawLexer<'_> {
     type Item = Result<RawToken, LogosError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (previous_token, span) = self.lexer.next()?;
-        self.pos = self.base_pos + BytePos(span.start as u32);
+        if let Some(next_token) = self.peeked.pop_front() {
+            return Some(Ok(next_token));
+        }
 
-        let item = match previous_token {
+        let next_token = self.lexer2.next()?;
+
+        let item = match next_token {
             Ok(item) => item,
             Err(e) => return Some(Err(e)),
         };
@@ -256,9 +284,11 @@ pub enum RawToken {
     RBracket,
 
     #[token("{")]
+    /// Token of '{'
     LBrace,
 
     #[token("}")]
+    /// Token of '}'
     RBrace,
 
     #[token(";")]
@@ -292,7 +322,7 @@ pub enum RawToken {
     #[token("\"", callback = consume_str_double_quote)]
     Str,
 
-    #[regex(r"(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")]
+    #[regex(r"(?:0|[1-9]\d*)(\.\d*)?(?:[eE][+-]?\d+)?")]
     #[regex(r"0[xX][a-fA-F0-9]+")]
     #[regex(r"0[oO][0-7]+")]
     #[regex(r"0[bB][01]+")]
@@ -303,9 +333,6 @@ pub enum RawToken {
 
     #[regex(r#"[0-9]+n"#)]
     BigInt,
-
-    #[token("#![^ \n\r\t]*")]
-    Shebang,
 
     #[token("null")]
     Null,
@@ -329,13 +356,15 @@ pub enum RawToken {
     NotEqEqOp,
 
     #[token("<")]
-    LtOp,
+    /// Token of '<'
+    LtAngle,
 
     #[token("<=")]
     LtEqOp,
 
     #[token(">")]
-    GtOp,
+    /// Token of '>'
+    GtAngle,
 
     #[token(">=")]
     GtEqOp,
@@ -438,13 +467,33 @@ pub enum RawToken {
     /// TODO: Move jsx lexing to RawLexer
     JsxTagEnd,
 
-    #[regex(r"([\p{XID_Start}_$]|\\u[a-fA-F0-9]{4})([\p{XID_Continue}_$]|\\u[a-fA-F0-9]{4})*")]
+    #[regex(
+        r"([\p{XID_Start}_$]|\\u[a-fA-F0-9]{4}|\\u\{[a-fA-F0-9]+\})",
+        priority = 10,
+        callback = consume_ident_part,
+    )]
     Ident,
 
-    #[regex("[\n|\r]+", priority = 5, callback = newline_callback)]
+    /// Line terminator https://tc39.es/ecma262/#sec-line-terminators
+    ///
+    /// ```text
+    /// LineTerminator ::
+    ///     <LF> (U+000A)
+    ///     <CR> (U+000D)
+    ///     <LS> (U+2028)
+    ///     <PS> (U+2029)
+    ///
+    /// LineTerminatorSequence ::
+    ///     <LF>
+    ///     <CR> [lookahead ≠ <LF>]
+    ///     <LS>
+    ///     <PS>
+    ///     <CR> <LF>
+    /// ```
+    #[regex(r"(\u{000d}\u{000a}|[\u{000a}\u{000d}\u{2029}\u{2029}])", priority = 5, callback = newline_callback)]
     NewLine,
 
-    #[regex(r"[ \t]+", callback = whitespace_callback)]
+    #[regex(r"[ \t]+")]
     Whitespace,
 
     #[regex(r"//[^\n]*")]
@@ -650,12 +699,14 @@ pub enum RawToken {
     #[token("unknown")]
     Unknown,
 
+    /// Ts types - string
     #[token("string")]
     String,
 
     #[token("object")]
     Object,
 
+    /// Ts types - number
     #[token("number")]
     Number,
 
@@ -697,15 +748,15 @@ pub enum RawToken {
 
     #[token("public")]
     Public,
+
+    #[token(r"\")]
+    BackSlash,
 }
 
-fn newline_callback(l: &mut Lexer<RawToken>) -> Skip {
+fn newline_callback(l: &mut Lexer<RawToken>) -> RawToken {
     l.extras.had_line_break = true;
-    Skip
-}
 
-fn whitespace_callback(_: &mut Lexer<RawToken>) -> Skip {
-    Skip
+    RawToken::NewLine
 }
 
 impl RawToken {

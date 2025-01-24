@@ -1,8 +1,9 @@
 use either::Either;
+use logos::Source;
 use smartstring::{LazyCompact, SmartString};
 use swc_ecma_raw_lexer::RawToken;
 
-use super::*;
+use super::{chars::CharsConsumer, *};
 
 impl Lexer<'_> {
     pub(super) fn read_jsx_token(&mut self, start: &mut BytePos) -> LexResult<Option<Token>> {
@@ -15,28 +16,30 @@ impl Lexer<'_> {
             let cur = match self.cur()? {
                 Some(c) => c,
                 None => {
-                    let start = self.state.start;
-                    self.error(start, SyntaxError::UnterminatedJSXContents)?
+                    return Err(Error::new(
+                        self.input.span(),
+                        SyntaxError::UnterminatedJSXContents,
+                    ));
                 }
             };
             let cur_pos = self.input.cur_pos();
 
             match cur {
                 RawToken::ConflictMarker => {
-                    let span = Span::new(cur_pos, cur_pos + BytePos(7));
-
-                    self.emit_error_span(span, SyntaxError::TS1185);
+                    self.emit_error_span(self.input.span(), SyntaxError::TS1185);
                     // Bump conflict marker
-                    self.input.next();
+                    self.consume_token();
 
                     *start = self.input.cur_pos();
                     return self.try_read_token(start);
                 }
-                RawToken::LtOp | RawToken::LBrace => {
-                    //
-                    if cur_pos == self.state.start {
-                        if cur == RawToken::LtOp && self.state.is_expr_allowed {
-                            self.input.next();
+                RawToken::LtAngle | RawToken::LBrace => {
+                    // <div> {app}<div>
+                    // }<div> have not any word
+                    // so we do not need to generate JsxText
+                    if cur_pos == chunk_start {
+                        if cur == RawToken::LtAngle && self.state.is_expr_allowed {
+                            self.consume_token();
                             return Ok(Some(Token::JSXTagStart));
                         }
                         *start = self.input.cur_pos();
@@ -49,26 +52,31 @@ impl Lexer<'_> {
                             // Safety: We already checked for the range
                             self.input.slice(chunk_start, cur_pos)
                         };
-                        self.atoms.atom(s)
+                        s
                     } else {
                         value.push_str(unsafe {
                             // Safety: We already checked for the range
                             self.input.slice(chunk_start, cur_pos)
                         });
-                        self.atoms.atom(value)
+                        &value
                     };
 
                     let raw = {
                         let s = unsafe {
                             // Safety: We already checked for the range
-                            self.input.slice(*start, cur_pos)
+                            self.input.slice(chunk_start, cur_pos)
                         };
                         self.atoms.atom(s)
                     };
 
-                    return Ok(Some(Token::JSXText { raw, value }));
+                    let value = self.read_jsx_text(value, true)?;
+
+                    return Ok(Some(Token::JSXText {
+                        raw,
+                        value: self.atoms.atom(value),
+                    }));
                 }
-                RawToken::GtOp => {
+                RawToken::GtAngle => {
                     self.emit_error(
                         cur_pos,
                         SyntaxError::UnexpectedTokenWithSuggestions {
@@ -99,19 +107,26 @@ impl Lexer<'_> {
                 }
 
                 _ => {
-                    if cur.is_line_terminator() {
-                        value.push_str(unsafe {
-                            // Safety: We already checked for the range
-                            self.input.slice(chunk_start, cur_pos)
-                        });
-                        match self.read_jsx_new_line(true)? {
-                            Either::Left(s) => value.push_str(s),
-                            Either::Right(c) => value.push(c),
-                        }
-                        chunk_start = self.input.cur_pos();
-                    } else {
-                        self.input.next();
-                    }
+                    self.input.next();
+                    // if cur.is_line_terminator() {
+                    //     value.push_str(unsafe {
+                    //         // Safety: We already checked for the range
+                    //         self.input.slice(chunk_start, cur_pos)
+                    //     });
+                    //     match self.read_jsx_new_line(true)? {
+                    //         Either::Left(s) => {
+                    //             dbg!(&s);
+                    //             value.push_str(s);
+                    //         }
+                    //         Either::Right(c) => {
+                    //             dbg!(&c);
+                    //             value.push(c);
+                    //         }
+                    //     }
+                    //     chunk_start = self.input.cur_pos();
+                    // } else {
+                    //     self.input.next();
+                    // }
                 }
             }
         }
@@ -215,10 +230,38 @@ impl Lexer<'_> {
     pub(super) fn read_jsx_str(&mut self) -> LexResult<Token> {
         debug_assert!(self.syntax.jsx());
 
-        let s = self.input.cur_slice();
-        let value = &s[1..s.len() - 1];
+        let cur_slice = self.input.cur_slice();
 
-        let raw = self.atoms.atom(s);
+        // omit ' and '
+        let raw = self.atoms.atom(cur_slice);
+
+        let mut value = String::new();
+
+        let mut chars = CharsConsumer::new(&cur_slice[1..cur_slice.len() - 1], self.input.span());
+
+        while let Some(char) = chars.peek() {
+            match char {
+                '&' => {
+                    let escape_sequence = chars.consume_until(|c| matches!(c, ';'));
+                    match self.read_html_escape(&escape_sequence)? {
+                        Some(ch) => {
+                            value.push(ch);
+                            // consume ';'
+                            chars.next();
+                        }
+                        None => {
+                            value.push_str(&escape_sequence);
+                        }
+                    }
+                }
+                other => {
+                    value.push(other);
+                    // consume char
+                    chars.next();
+                }
+            }
+        }
+
         let value = self.atoms.atom(value);
 
         // it might be at the end of the file when
@@ -228,6 +271,69 @@ impl Lexer<'_> {
         }
 
         Ok(Token::Str { value, raw })
+    }
+
+    fn read_jsx_text(&self, text: &str, normalize_crlf: bool) -> LexResult<String> {
+        let mut chars = text.chars();
+
+        let mut value = String::new();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\r' && chars.as_str().starts_with('\n') {
+                // consome '\n'
+                chars.next();
+                value.push_str(if normalize_crlf { "\n" } else { "\r\n" });
+            } else {
+                value.push(ch);
+            }
+        }
+
+        Ok(value)
+    }
+
+    /// try read html escape such as &#32; , &134; , &sup3; from text;
+    fn read_html_escape(&self, text: &str) -> LexResult<Option<char>> {
+        let mut chars = text.chars();
+        // consume '&'
+        assert_eq!(chars.next(), Some('&'));
+
+        fn from_code(s: &str, radix: u32) -> LexResult<char> {
+            // TODO(kdy1): unwrap -> Err
+            let c = char::from_u32(
+                u32::from_str_radix(s, radix).expect("failed to parse string as number"),
+            )
+            .expect("failed to parse number as char");
+
+            Ok(c)
+        }
+
+        if chars.as_str().starts_with('#') {
+            // consume
+            chars.next();
+
+            let radix = if chars.as_str().starts_with(['x', 'X']) {
+                chars.next();
+                16
+            } else {
+                10
+            };
+
+            let code = chars.as_str();
+            let valid_digits = if radix == 16 {
+                code.chars().all(|c| c.is_ascii_hexdigit())
+            } else {
+                code.chars().all(|c| c.is_ascii_digit())
+            };
+
+            if valid_digits {
+                Some(from_code(code, radix)).transpose()
+            } else {
+                Ok(None)
+            }
+        } else {
+            let code = chars.as_str();
+            Ok(xhtml(code))
+        }
     }
 }
 

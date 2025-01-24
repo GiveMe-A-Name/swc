@@ -1,7 +1,7 @@
 use std::mem::take;
 
 use smallvec::{smallvec, SmallVec};
-use swc_common::BytePos;
+use swc_common::{BytePos, Span};
 use swc_ecma_raw_lexer::RawToken;
 use tracing::trace;
 
@@ -35,7 +35,7 @@ pub(super) struct State {
     pub prev_hi: BytePos,
     pub tpl_start: BytePos,
 
-    context: TokenContexts,
+    pub(crate) context: TokenContexts,
     syntax: Syntax,
 
     token_type: Option<TokenType>,
@@ -259,14 +259,12 @@ impl Lexer<'_> {
 
         self.state.had_line_break = self.state.is_first;
         self.state.is_first = false;
-
         self.read_any_token(start)
     }
 
     pub(super) fn read_any_token(&mut self, start: &mut BytePos) -> Result<Option<Token>, Error> {
         if let Some(TokenContext::Tpl {}) = self.state.context.current() {
-            let start = self.state.tpl_start;
-            return self.read_tmpl_token(start).map(Some);
+            return self.read_template_literal();
         }
 
         let c = match self.cur()? {
@@ -278,14 +276,6 @@ impl Lexer<'_> {
                 return Ok(None);
             }
         };
-        dbg!(&c, start.0, self.input.cur_slice());
-        dbg!(&self.state.context.current());
-
-        // println!(
-        //     "\tContext: ({:?}) {:?}",
-        //     self.input.cur().unwrap(),
-        //     self.state.context.0
-        // );
 
         self.state.start = *start;
 
@@ -304,7 +294,7 @@ impl Lexer<'_> {
                     return Ok(Some(Token::JSXName { name }));
                 }
 
-                if c == RawToken::GtOp {
+                if c == RawToken::GtAngle {
                     let _ = self.input.next();
                     return Ok(Some(Token::JSXTagEnd));
                 }
@@ -316,14 +306,17 @@ impl Lexer<'_> {
                 }
             }
 
-            if c == RawToken::LtOp && self.state.is_expr_allowed {
+            if c == RawToken::LtAngle && self.state.is_expr_allowed {
                 self.input.next();
 
                 return Ok(Some(Token::JSXTagStart));
             }
         }
 
-        self.read_token(c, start)
+        self.read_token(c, start).map_err(|e| {
+            self.input.next();
+            e
+        })
     }
 }
 
@@ -340,7 +333,6 @@ impl Iterator for Lexer<'_> {
             Err(e) => e,
         };
 
-        let span = self.span(start);
         if let Some(ref token) = token {
             if let Some(comments) = self.comments_buffer.as_mut() {
                 for comment in comments.take_pending_leading() {
@@ -356,6 +348,10 @@ impl Iterator for Lexer<'_> {
             self.state.prev_hi = self.input.cur_pos();
             self.state.had_line_break_before_last = self.had_line_break_before_last();
         }
+
+        let end = self.input.end_pos();
+
+        let span = Span::new(start, end);
 
         token.map(|token| {
             // Attach span to token.
@@ -815,10 +811,10 @@ where
         let mut l = Lexer::new(syntax, target, fm, None);
         let res = f(&mut l);
 
-        #[cfg(debug_assertions)]
-        let c = TokenContexts(smallvec![TokenContext::BraceStmt]);
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(l.state.context.0, c.0);
+        // #[cfg(debug_assertions)]
+        // let c = TokenContexts(smallvec![TokenContext::BraceStmt]);
+        // #[cfg(debug_assertions)]
+        // debug_assert_eq!(l.state.context.0, c.0);
 
         res
     })

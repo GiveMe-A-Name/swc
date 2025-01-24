@@ -2,7 +2,7 @@
 //!
 //!
 //! [babylon/util/identifier.js]:https://github.com/babel/babel/blob/master/packages/babylon/src/util/identifier.js
-use std::char;
+use std::{char, str::Chars};
 
 use swc_common::{
     comments::{Comment, CommentKind},
@@ -64,7 +64,7 @@ impl Lexer<'_> {
             return;
         }
 
-        warn!("Lexer error at {:?}", span);
+        // warn!("Lexer error at {:?}", span);
         let err = Error::new(span, kind);
         self.errors.borrow_mut().push(err);
     }
@@ -137,6 +137,11 @@ impl Lexer<'_> {
                 });
             }
         }
+    }
+
+    #[inline]
+    pub(super) fn allow_jsx(&self) -> bool {
+        self.syntax.jsx() && !self.ctx.in_property_name && !self.ctx.in_type
     }
 }
 

@@ -19,14 +19,18 @@ use crate::{
     Context, Syntax,
 };
 
+mod chars;
 mod comments_buffer;
 #[deprecated = "Directly use swc_common::input instead"]
 pub mod input;
 mod jsx;
 mod number;
 mod state;
+mod string;
+mod template;
 #[cfg(test)]
 mod tests;
+mod unicode;
 pub mod util;
 
 pub(crate) type LexResult<T> = Result<T, Error>;
@@ -183,7 +187,9 @@ impl<'a> Lexer<'a> {
             RawToken::LegacyCommentOpen | RawToken::LegacyCommentClose => {
                 // XML style comment. `<!--`
                 self.input.next();
-                self.emit_module_mode_error(*start, SyntaxError::LegacyCommentInModule);
+
+                let span = self.input.span();
+                self.emit_module_mode_error_span(span, SyntaxError::LegacyCommentInModule);
 
                 *start = self.input.cur_pos();
                 return self.read_any_token(start);
@@ -198,7 +204,9 @@ impl<'a> Lexer<'a> {
                 //    ^
 
                 self.emit_error_span(fixed_len_span(*start, 7), SyntaxError::TS1185);
-                let _ = self.input.next();
+
+                // consume conflict marker
+                self.input.next();
 
                 *start = self.input.cur_pos();
                 return self.read_any_token(start);
@@ -227,29 +235,21 @@ impl<'a> Lexer<'a> {
             RawToken::Str => {
                 let s = self.input.cur_slice();
                 let value = &s[1..s.len() - 1];
+                let mut span = self.input.span();
+                span.lo = span.lo + BytePos(1);
+                span.hi = span.hi - BytePos(1);
 
                 Token::Str {
-                    value: self.atoms.atom(value),
+                    value: self.atoms.atom(self.string_literal(value, span)?),
                     raw: self.atoms.atom(s),
                 }
             }
             RawToken::Num => {
-                let s = self.input.cur_slice();
-                let value = if let Some(s) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    usize::from_str_radix(s, 16).unwrap() as f64
-                } else if let Some(s) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
-                    usize::from_str_radix(s, 8).unwrap() as f64
-                } else if let Some(s) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-                    usize::from_str_radix(s, 2).unwrap() as f64
-                } else {
-                    s.parse::<f64>().unwrap_or_else(|_| {
-                        panic!("failed to parse number: {}", s);
-                    })
-                };
-
+                let source = self.input.cur_slice();
+                let span = self.input.span();
                 Token::Num {
-                    value,
-                    raw: self.atoms.atom(self.input.cur_slice()),
+                    value: self.read_number_literal(source, span)?,
+                    raw: self.atoms.atom(source),
                 }
             }
             RawToken::LegacyOctalNum => {
@@ -271,13 +271,12 @@ impl<'a> Lexer<'a> {
                 raw: self.atoms.atom(self.input.cur_slice()),
             },
 
-            RawToken::Shebang => {
-                self.emit_error(*start, SyntaxError::UnexpectedCharFromLexer);
-                self.input.next();
+            // RawToken::Shebang => {
+            //     self.emit_error(*start, SyntaxError::UnexpectedCharFromLexer);
+            //     self.input.next();
 
-                return self.try_read_token(start);
-            }
-
+            //     return self.try_read_token(start);
+            // }
             RawToken::Null => Token::Word(Word::Null),
             RawToken::True => Token::Word(Word::True),
             RawToken::False => Token::Word(Word::False),
@@ -285,9 +284,9 @@ impl<'a> Lexer<'a> {
             RawToken::NotEqOp => Token::BinOp(BinOpToken::NotEq),
             RawToken::EqEqEqOp => Token::BinOp(BinOpToken::EqEqEq),
             RawToken::NotEqEqOp => Token::BinOp(BinOpToken::NotEqEq),
-            RawToken::LtOp => Token::BinOp(BinOpToken::Lt),
+            RawToken::LtAngle => Token::BinOp(BinOpToken::Lt),
             RawToken::LtEqOp => Token::BinOp(BinOpToken::LtEq),
-            RawToken::GtOp => Token::BinOp(BinOpToken::Gt),
+            RawToken::GtAngle => Token::BinOp(BinOpToken::Gt),
             RawToken::GtEqOp => Token::BinOp(BinOpToken::GtEq),
             RawToken::LShiftOp => Token::BinOp(BinOpToken::LShift),
             RawToken::RShiftOp => Token::BinOp(BinOpToken::RShift),
@@ -324,14 +323,21 @@ impl<'a> Lexer<'a> {
             RawToken::JsxTagStart => Token::JSXTagStart,
             RawToken::JsxTagEnd => Token::JSXTagEnd,
 
-            RawToken::Ident => Token::Word(Word::Ident(IdentLike::Other({
-                self.atoms.atom(self.input.cur_slice())
-            }))),
-            RawToken::NewLine | RawToken::Whitespace => {
-                let _ = self.input.next();
-                // self.skip_space::<true>();
+            RawToken::Ident => {
+                let source = self.input.cur_slice().to_string();
+                let span = self.input.span();
 
-                *start = self.input.cur_pos();
+                let identifier_name = self.identifier_name(&source, span)?;
+
+                Token::Word(Word::Ident(IdentLike::Other({
+                    self.atoms.atom(identifier_name)
+                })))
+            }
+            RawToken::NewLine | RawToken::Whitespace | RawToken::BackSlash => {
+                // consume the new_line or whitespace
+                let _ = self.input.next();
+
+                // *start = self.input.cur_pos();
                 return self.read_any_token(start);
             }
             RawToken::LineComment | RawToken::BlockComment => {
@@ -475,7 +481,7 @@ impl<'a> Lexer<'a> {
             '\r' => {
                 self.bump(); // remove '\r'
 
-                self.input.eat(RawToken::NewLine);
+                // self.input.eat(RawToken::NewLine);
 
                 return Ok(None);
             }
@@ -703,11 +709,34 @@ impl Lexer<'_> {
 
     #[cold]
     fn read_shebang(&mut self) -> LexResult<Option<Atom>> {
-        if !self.input.eat(RawToken::Shebang) {
-            return Ok(None);
+        if self.cur()? == Some(RawToken::Hash) && self.ahead_token()? == Some(RawToken::Bang) {
+            // consume '#'
+            self.consume_token();
+
+            // consume '!'
+            self.consume_token();
+            let start = self.input.end_pos();
+
+            while let Some(next_token) = self.cur()? {
+                if next_token != RawToken::NewLine {
+                    self.consume_token();
+                } else {
+                    break;
+                }
+            }
+
+            let end = self.input.start_pos();
+
+            let shebang_str = unsafe { self.input.slice(start, end) };
+
+            Ok(Some(self.atoms.atom(shebang_str)))
+        } else {
+            Ok(None)
         }
 
-        Ok(Some(self.atoms.atom(self.input.cur_slice())))
+        // if self.cur()? != Some(RawToken::Hash) && self.input.peek_ahead() {
+        //     return Ok(None);
+        // }
     }
 
     fn read_tmpl_token(&mut self, start_of_tpl: BytePos) -> LexResult<Token> {
@@ -840,14 +869,27 @@ impl Lexer<'_> {
 
     #[inline(never)]
     fn cur(&mut self) -> LexResult<Option<RawToken>> {
-        match self.input.cur() {
-            Err(err) => {
-                let start = self.input.cur_pos();
-                let _ = self.input.next();
-                Err(Error::new(self.span(start), SyntaxError::from(err)))
-            }
-            Ok(v) => Ok(v),
-        }
+        self.input.cur().map_err(|err| {
+            let start = self.input.cur_pos();
+            // It will consume error token, if logos parse next error.
+            // So we don't need consume it manually
+            // let _ = self.input.next();
+
+            Error::new(self.span(start), SyntaxError::from(err))
+        })
+    }
+
+    #[inline]
+    fn ahead_token(&mut self) -> LexResult<Option<RawToken>> {
+        self.input.peek_ahead().map_err(|err| {
+            let start = self.input.cur_pos();
+            Error::new(self.span(start), SyntaxError::from(err))
+        })
+    }
+
+    #[inline]
+    fn consume_token(&mut self) {
+        self.input.next();
     }
 }
 

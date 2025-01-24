@@ -27,63 +27,63 @@ where
 }
 
 fn bench_cases(c: &mut Criterion) {
-    c.bench_function("es/visitor/compare/clone", |b| run(b, |m| m));
+    // c.bench_function("es/visitor/compare/clone", |b| run(b, |m| m));
 
-    c.bench_function("es/visitor/compare/visit_mut_span", |b| {
-        struct RespanVisitMut;
+    // c.bench_function("es/visitor/compare/visit_mut_span", |b| {
+    //     struct RespanVisitMut;
 
-        impl VisitMut for RespanVisitMut {
-            fn visit_mut_span(&mut self, span: &mut Span) {
-                *span = DUMMY_SP;
-            }
-        }
+    //     impl VisitMut for RespanVisitMut {
+    //         fn visit_mut_span(&mut self, span: &mut Span) {
+    //             *span = DUMMY_SP;
+    //         }
+    //     }
 
-        run(b, |mut m| {
-            m.visit_mut_with(&mut RespanVisitMut);
+    //     run(b, |mut m| {
+    //         m.visit_mut_with(&mut RespanVisitMut);
 
-            m
-        });
-    });
+    //         m
+    //     });
+    // });
 
-    c.bench_function("es/visitor/compare/visit_mut_span_panic", |b| {
-        struct RespanVisitMut;
+    // c.bench_function("es/visitor/compare/visit_mut_span_panic", |b| {
+    //     struct RespanVisitMut;
 
-        impl VisitMut for RespanVisitMut {
-            fn visit_mut_span(&mut self, span: &mut Span) {
-                *span = DUMMY_SP;
-            }
-        }
+    //     impl VisitMut for RespanVisitMut {
+    //         fn visit_mut_span(&mut self, span: &mut Span) {
+    //             *span = DUMMY_SP;
+    //         }
+    //     }
 
-        run(b, |mut m| {
-            m.visit_mut_with(&mut RespanVisitMut);
+    //     run(b, |mut m| {
+    //         m.visit_mut_with(&mut RespanVisitMut);
 
-            m
-        });
-    });
+    //         m
+    //     });
+    // });
 
-    c.bench_function("es/visitor/compare/fold_span", |b| {
-        struct RespanFold;
+    // c.bench_function("es/visitor/compare/fold_span", |b| {
+    //     struct RespanFold;
 
-        impl Fold for RespanFold {
-            fn fold_span(&mut self, _: Span) -> Span {
-                DUMMY_SP
-            }
-        }
+    //     impl Fold for RespanFold {
+    //         fn fold_span(&mut self, _: Span) -> Span {
+    //             DUMMY_SP
+    //         }
+    //     }
 
-        run(b, |m| m.fold_with(&mut RespanFold));
-    });
+    //     run(b, |m| m.fold_with(&mut RespanFold));
+    // });
 
-    c.bench_function("es/visitor/compare/fold_span_panic", |b| {
-        struct RespanFold;
+    // c.bench_function("es/visitor/compare/fold_span_panic", |b| {
+    //     struct RespanFold;
 
-        impl Fold for RespanFold {
-            fn fold_span(&mut self, _: Span) -> Span {
-                DUMMY_SP
-            }
-        }
+    //     impl Fold for RespanFold {
+    //         fn fold_span(&mut self, _: Span) -> Span {
+    //             DUMMY_SP
+    //         }
+    //     }
 
-        run(b, |m| m.fold_with(&mut RespanFold));
-    });
+    //     run(b, |m| m.fold_with(&mut RespanFold));
+    // });
 }
 
 criterion_group!(benches, bench_cases);
